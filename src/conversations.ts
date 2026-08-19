@@ -9,6 +9,11 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { BaseMessage } from '@wecom/aibot-node-sdk'
+import {
+  type ApprovalCommand,
+  type ResolvedApproval,
+  WeComApprovalRegistry,
+} from './approvals.js'
 import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
@@ -42,13 +47,16 @@ export class ConversationManager {
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly activeTurns = new Map<string, string>()
   private readonly generations = new Map<string, number>()
+  private readonly approvals: WeComApprovalRegistry
   private persistedIds = new Set<string>()
 
   constructor(
     private readonly ctx: Context,
     private readonly config: Config,
     private readonly sendFile: ConversationFileSender,
-  ) {}
+  ) {
+    this.approvals = new WeComApprovalRegistry(config.approvalTimeoutMs)
+  }
 
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize(): Promise<void> {
@@ -57,9 +65,15 @@ export class ConversationManager {
   }
 
   /** Process one inbound message after earlier work in the same WeCom conversation. */
-  process(message: BaseMessage, client: WeComDownloadPort): Promise<ConversationReply> {
+  process(
+    message: BaseMessage,
+    client: WeComDownloadPort,
+    sendApprovalPrompt: (text: string) => Promise<void> = () =>
+      Promise.reject(new Error('WeCom approval prompt sender is unavailable')),
+  ): Promise<ConversationReply> {
     const baseId = sessionIdFor(this.config.accountId, message)
-    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client))
+    return this.enqueue(baseId, () =>
+      this.processNow(this.currentSessionId(baseId), message, client, sendApprovalPrompt))
   }
 
   /** End the current WeCom conversation session while retaining its history. */
@@ -81,7 +95,12 @@ export class ConversationManager {
   }
 
   /** Execute a registered Harness command against the current WeCom session. */
-  executeCommand(message: BaseMessage, line: string): Promise<ConversationCommandReply> {
+  executeCommand(
+    message: BaseMessage,
+    line: string,
+    sendApprovalPrompt: (text: string) => Promise<void> = () =>
+      Promise.reject(new Error('WeCom approval prompt sender is unavailable')),
+  ): Promise<ConversationCommandReply> {
     const baseId = sessionIdFor(this.config.accountId, message)
     return this.enqueue(baseId, async () => {
       const id = this.currentSessionId(baseId)
@@ -98,6 +117,11 @@ export class ConversationManager {
         controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
       }, this.config.responseTimeoutMs)
       this.activeTurns.set(id, chatTarget(message))
+      const stopApprovalAnswerer = agent.ctx.on(
+        'approval/request',
+        request => this.approvals.request(id, request, sendApprovalPrompt),
+        { prepend: true },
+      )
       try {
         const execution = await this.ctx.commands.execute(agent, line, controller.signal)
         if (execution === undefined) return { execution, response: undefined }
@@ -108,6 +132,7 @@ export class ConversationManager {
           : undefined
         return { execution, response }
       } finally {
+        stopApprovalAnswerer()
         clearTimeout(timer)
         this.activeTurns.delete(id)
       }
@@ -118,14 +143,22 @@ export class ConversationManager {
   cancel(message: BaseMessage): boolean {
     const baseId = sessionIdFor(this.config.accountId, message)
     const id = this.currentSessionId(baseId)
+    const approvalCancelled = this.approvals.cancelConversation(id)
     const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
-    if (agent === undefined || agent.status === 'idle') return false
+    if (agent === undefined || agent.status === 'idle') return approvalCancelled
     agent.cancel({ kind: 'user' })
     return true
   }
 
+  /** Resolve a pending approval from its originating WeCom conversation. */
+  decideApproval(message: BaseMessage, command: ApprovalCommand): ResolvedApproval | undefined {
+    const baseId = sessionIdFor(this.config.accountId, message)
+    return this.approvals.decide(this.currentSessionId(baseId), command)
+  }
+
   /** Dispose every bridge-owned Agent after queued message work settles. */
   async dispose(): Promise<void> {
+    this.approvals.cancelAll()
     await Promise.allSettled(this.queues.values())
     await Promise.allSettled([...this.bindings.values()].map(binding => binding.release()))
     this.bindings.clear()
@@ -167,6 +200,7 @@ export class ConversationManager {
     id: string,
     message: BaseMessage,
     client: WeComDownloadPort,
+    sendApprovalPrompt: (text: string) => Promise<void>,
   ): Promise<ConversationReply> {
     const binding = await this.getOrCreate(id)
     const agent = binding.agent
@@ -174,11 +208,17 @@ export class ConversationManager {
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
     const start = agent.session.events.length
     this.activeTurns.set(id, chatTarget(message))
+    const stopApprovalAnswerer = agent.ctx.on(
+      'approval/request',
+      request => this.approvals.request(id, request, sendApprovalPrompt),
+      { prepend: true },
+    )
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
       return await this.collectReply(agent, agent.session.events.slice(start))
     } finally {
+      stopApprovalAnswerer()
       this.activeTurns.delete(id)
     }
   }

@@ -4,6 +4,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { BaseMessage, WSClientOptions, WsFrame, EventMessageWith, EnterChatEvent, WsFrameHeaders, ReplyMsgItem, UploadMediaOptions, WeComMediaType } from '@wecom/aibot-node-sdk';
 import { ImageMediaType } from '@deepseek-ai/dsh-attachment';
 import { ContentBlock } from '@deepseek-ai/dsh-llm';
+import { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval';
 
 /** Access policy for one WeCom chat scope. */
 type AccessMode = 'open' | 'allowlist' | 'disabled';
@@ -28,6 +29,7 @@ interface Config {
     welcomeText: string;
     startupTimeoutMs: number;
     responseTimeoutMs: number;
+    approvalTimeoutMs: number;
     mediaDownloadTimeoutMs: number;
     sendTimeoutMs: number;
     reconnectIntervalMs: number;
@@ -108,6 +110,37 @@ declare class WeComHarnessBridge {
     private requireClient;
 }
 
+/** A one-shot approval decision sent from a WeCom conversation. */
+interface ApprovalCommand {
+    code: string;
+    outcome: Extract<ApprovalOutcome, 'allowed-once' | 'rejected'>;
+}
+/** The pending request resolved by an approval command. */
+interface ResolvedApproval {
+    code: string;
+    outcome: ApprovalCommand['outcome'];
+    toolName: string;
+}
+/** Parse approval and rejection commands without forwarding malformed decisions to the model. */
+declare function parseApprovalCommand(text: string): ApprovalCommand | 'invalid' | undefined;
+/** Owns requester-bound, expiring approval decisions for the WeCom channel. */
+declare class WeComApprovalRegistry {
+    private readonly timeoutMs;
+    private readonly pending;
+    constructor(timeoutMs: number);
+    /** Send one approval prompt and await its single decision. */
+    request(conversationId: string, request: ApprovalRequest, sendPrompt: (text: string) => Promise<void>): Promise<ApprovalOutcome>;
+    /** Decide only a request originating from the same WeCom conversation. */
+    decide(conversationId: string, command: ApprovalCommand): ResolvedApproval | undefined;
+    /** Cancel every pending request for one conversation. */
+    cancelConversation(conversationId: string): boolean;
+    /** Cancel every pending request during channel teardown. */
+    cancelAll(): void;
+    private createCode;
+}
+/** Render the structured tool call associated with one Harness approval request. */
+declare function formatApprovalPrompt(request: ApprovalRequest, code: string, timeoutMs: number): string;
+
 /** Deterministic, non-identifying DSH session id for one WeCom conversation. */
 declare function sessionIdFor(accountId: string, message: Pick<BaseMessage, 'chattype' | 'chatid' | 'from'>): string;
 /** Target id accepted by WeCom proactive-send APIs. */
@@ -126,8 +159,14 @@ declare class SeenMessageIds {
 declare const name = "deepseek-harness-wecom";
 declare const inject: string[];
 
-/** Mount the WeCom long connection and tie teardown to the Cordis plugin lifecycle. */
-declare function apply(ctx: Context, config: Config): Promise<void>;
+interface WeComBridgeLifecycle {
+    start(): Promise<void>;
+    stop(): Promise<void>;
+}
+/** Mount the WeCom connection in the background and tie teardown to the Cordis plugin lifecycle. */
+declare function mountBridge(ctx: Context, bridge: WeComBridgeLifecycle): void;
+/** Create and mount the WeCom connection without awaiting external authentication. */
+declare function apply(ctx: Context, config: Config): void;
 declare const _default: {
     name: string;
     inject: string[];
@@ -135,4 +174,4 @@ declare const _default: {
     apply: typeof apply;
 };
 
-export { Config, Config as ConfigType, SeenMessageIds, WeComHarnessBridge, apply, chatTarget, _default as default, detectImageMediaType, inboundContent, inject, name, sessionIdFor, truncateUtf8 };
+export { type ApprovalCommand, Config, Config as ConfigType, type ResolvedApproval, SeenMessageIds, WeComApprovalRegistry, WeComHarnessBridge, apply, chatTarget, _default as default, detectImageMediaType, formatApprovalPrompt, inboundContent, inject, mountBridge, name, parseApprovalCommand, sessionIdFor, truncateUtf8 };

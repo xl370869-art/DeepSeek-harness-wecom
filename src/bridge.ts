@@ -19,6 +19,7 @@ import {
   type WsFrame,
   type WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
+import { parseApprovalCommand } from './approvals.js'
 import type { Config } from './config.js'
 import {
   ConversationManager,
@@ -94,6 +95,9 @@ export class WeComHarnessBridge {
       throw new Error(
         `wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(config.inboundFileDirectory)}`,
       )
+    }
+    if (config.approvalTimeoutMs >= config.responseTimeoutMs) {
+      throw new Error('wecom-channel: approvalTimeoutMs must be less than responseTimeoutMs')
     }
     this.log = ctx.logger('deepseek-harness-wecom')
     this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file))
@@ -189,7 +193,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom/0.1.4',
+      plug_version: 'deepseek-harness-wecom/0.1.5',
     })
   }
 
@@ -214,6 +218,24 @@ export class WeComHarnessBridge {
     if (message === undefined || this.seen.hasOrAdd(message.msgid) || !this.allowed(message)) return
     try {
       const command = slashCommand(message)
+      const approvalCommand = parseApprovalCommand(command?.line ?? '')
+      if (approvalCommand === 'invalid') {
+        await this.sendReply(frame, {
+          text: '审批命令格式不正确。请回复 /approve 123456 或 /reject 123456。',
+          images: [],
+        })
+        return
+      }
+      if (approvalCommand !== undefined) {
+        const resolved = this.conversations.decideApproval(message, approvalCommand)
+        const text = resolved === undefined
+          ? '没有找到待处理的审批 ' + approvalCommand.code + '；它可能已完成、取消或超时。'
+          : resolved.outcome === 'allowed-once'
+            ? '已批准 ' + resolved.toolName + '（' + resolved.code + '），正在继续执行。'
+            : '已拒绝 ' + resolved.toolName + '（' + resolved.code + '）。'
+        await this.sendReply(frame, { text, images: [] })
+        return
+      }
       if (command?.name === 'bot-ping') {
         await this.sendReply(frame, { text: 'pong — DeepSeek Harness 企微机器人已连接。', images: [] })
         return
@@ -271,7 +293,11 @@ export class WeComHarnessBridge {
         return
       }
       if (command !== undefined && this.allowedHarnessCommands.has(command.name)) {
-        const outcome = await this.conversations.executeCommand(message, command.line)
+        const outcome = await this.conversations.executeCommand(
+          message,
+          command.line,
+          text => this.sendReply(frame, { text, images: [] }),
+        )
         await this.sendReply(frame, this.commandReply(command.name, outcome))
         return
       }
@@ -283,7 +309,11 @@ export class WeComHarnessBridge {
         return
       }
 
-      const reply = await this.conversations.process(message, this.requireClient())
+      const reply = await this.conversations.process(
+        message,
+        this.requireClient(),
+        text => this.sendReply(frame, { text, images: [] }),
+      )
       await this.sendReply(frame, reply)
     } catch (error) {
       this.log.error('WeCom message %s failed: %s', message.msgid, String(error))
@@ -307,6 +337,8 @@ export class WeComHarnessBridge {
       '/bot-file-test — 发送一个文本附件，检查文件出站链路',
       '/bot-status — 查看当前会话状态',
       '/bot-cancel — 取消当前生成',
+      '/approve 123456 — 批准一次待处理工具调用',
+      '/reject 123456 — 拒绝一次待处理工具调用',
       `已开放的 Harness 命令：${harnessCommands}（仅在当前 preset 注册后可用）`,
       '其他斜杠命令会被插件拒绝，不会送给模型；普通消息会交给当前 Harness 默认模型处理。',
     ].join('\n')

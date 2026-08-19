@@ -9,6 +9,7 @@ export const inject = [
   'agentDefaultModel',
   'agentPresets',
   'agents',
+  'approval',
   'attachments',
   'commands',
   'credentials',
@@ -19,16 +20,35 @@ export const inject = [
 export { Config }
 export type { WeComConfig as ConfigType }
 export { WeComHarnessBridge }
+export { formatApprovalPrompt, parseApprovalCommand, WeComApprovalRegistry } from './approvals.js'
+export type { ApprovalCommand, ResolvedApproval } from './approvals.js'
 export { detectImageMediaType, inboundContent } from './inbound.js'
 export { chatTarget, SeenMessageIds, sessionIdFor, truncateUtf8 } from './util.js'
 
-/** Mount the WeCom long connection and tie teardown to the Cordis plugin lifecycle. */
-export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
-  const bridge = new WeComHarnessBridge(ctx, config)
-  await ctx.effect(async function* () {
-    yield async () => bridge.stop()
-    await bridge.start()
+interface WeComBridgeLifecycle {
+  start(): Promise<void>
+  stop(): Promise<void>
+}
+
+/** Mount the WeCom connection in the background and tie teardown to the Cordis plugin lifecycle. */
+export function mountBridge(ctx: Context, bridge: WeComBridgeLifecycle): void {
+  const log = ctx.logger('deepseek-harness-wecom')
+  ctx.effect(() => {
+    const startup = Promise.resolve().then(() => bridge.start()).catch(async (error: unknown) => {
+      await Promise.allSettled([bridge.stop()])
+      log.warn('WeCom channel remains offline: %s. Harness startup is unaffected.', String(error))
+    })
+    return async () => {
+      await startup
+      await bridge.stop()
+    }
   }, 'deepseek-harness-wecom.websocket')
+}
+
+/** Create and mount the WeCom connection without awaiting external authentication. */
+export function apply(ctx: Context, config: WeComConfig): void {
+  const bridge = new WeComHarnessBridge(ctx, config)
+  mountBridge(ctx, bridge)
 }
 
 export default { name, inject, Config, apply }

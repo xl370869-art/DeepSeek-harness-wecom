@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -23,7 +23,7 @@ describe('resolveOutboundFile', () => {
     await writeFile(path, 'report')
 
     await expect(resolveOutboundFile(workspace, 'report.txt', 100)).resolves.toEqual({
-      path,
+      path: await realpath(path),
       name: 'report.txt',
       bytes: 6,
     })

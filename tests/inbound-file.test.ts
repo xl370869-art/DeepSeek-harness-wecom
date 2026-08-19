@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -24,7 +24,7 @@ describe('saveInboundFile', () => {
     const stored = await saveInboundFile(root, 'conversation', data, '../../report\n.txt', 100)
 
     expect(stored.name).toBe('report_.txt')
-    expect(relative(root, stored.path)).not.toMatch(/^\.\./u)
+    expect(relative(await realpath(root), stored.path)).not.toMatch(/^\.\./u)
     expect(await readFile(stored.path)).toEqual(data)
     if (process.platform !== 'win32') expect((await stat(stored.path)).mode & 0o777).toBe(0o600)
   })

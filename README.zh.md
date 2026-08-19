@@ -20,6 +20,7 @@
 - 每个单聊或群聊对应一个独立、可恢复的 Harness 会话
 - 挂载 Harness agent preset，使企微会话与网页会话使用相同的工具、提示词和技能组合
 - 网页已打开同一会话时安全复用 live Agent，不创建第二个 session writer
+- 工具审批可在原企微会话使用一次性的 `/approve <短码>` 或 `/reject <短码>` 决定
 - `/new`、`/reset` 会切换到新的持久会话，旧会话历史保留
 - 可配置转发当前 agent preset 注册的 Harness 斜杠命令，默认开放 `/compact`、`/goal`、`/plan`
 - 同会话消息串行处理、消息排重、发送重试和超时保护
@@ -33,7 +34,7 @@
 
 - Node.js 22.19 或更高版本
 - pnpm 10.33.4
-- DeepSeek Harness 0.1.0-rc.6 或更高版本
+- DeepSeek Harness 0.1.0-rc.7 或更高版本
 - 已开启长连接并取得 Bot ID、Secret 的企微智能机器人
 
 ## 安装
@@ -62,7 +63,7 @@ pnpm dsh --profile web
 
 组合包会读取 `WECOM_BOT_ID`，通过 `ctx.credentials` 解析 `WECOM_BOT_SECRET`，并默认让 agent 使用启动目录作为工作目录。可以用 `DSH_WECOM_CWD` 覆盖工作目录。
 
-安装组合包后不必立即配置凭据。Bot ID 为空，或引用的 Secret 不存在/为空时，通道会记录“未配置、保持休眠”的日志并允许 DSH 正常完成启动；补齐两项配置后重载或重启 DSH 即可连接。非空但错误的凭据仍会在企微鉴权阶段报错。
+安装组合包后不必立即配置凭据。Bot ID 为空，或引用的 Secret 不存在/为空时，通道会记录“未配置、保持休眠”的日志并允许 DSH 正常完成启动；补齐两项配置后重载或重启 DSH 即可连接。非空但错误的凭据只会让企微通道保持离线；鉴权在后台进行，不会导致 DSH 启动失败。
 
 长期使用时，建议把 `WECOM_BOT_ID` 放到 `~/.dsh/.env`，并通过 Harness 凭据设置界面保存 `WECOM_BOT_SECRET`。不要把任何真实凭据提交到 Git。
 
@@ -85,6 +86,7 @@ pnpm dsh --profile web
     inboundFileDirectory: /var/tmp/deepseek-harness-wecom/inbound
     maxInboundFileBytes: 20971520
     maxOutboundFileBytes: 20971520
+    approvalTimeoutMs: 240000
     welcomeText: 您好，我是 DeepSeek Harness 助手。
 ```
 
@@ -99,6 +101,8 @@ pnpm dsh --profile web
 `/new` 和 `/reset` 由企微插件直接处理：当前生成会先被请求取消，然后插件创建带递增后缀的新持久 session；旧 session 不删除，服务重启后也不会回到旧上下文。其他斜杠命令不会作为普通文本送进模型。`allowedHarnessCommands` 控制允许转发给 Harness 命令服务的名称，默认只开放 `/compact`、`/goal`、`/plan`；命令还必须由当前 agent preset 注册才可执行。`/permission` 可以显著扩大 agent 权限，只有同时严格限制 `singleAllowFrom` 和 `groupAllowFrom` 时才应显式加入。依赖网页下载界面的 `/export` 在企微中不可用。发送 `/help` 或 `/bot-help` 可查看企微侧可用命令。
 
 当前企微用户要求接收或下载文件时，agent 可以调用会话范围内的 `wecom_send_file` 工具。相对路径从 `cwd` 解析，绝对路径也必须位于 `cwd` 内。插件会先解析符号链接，只接受普通文件，并拒绝超过 `maxOutboundFileBytes` 的文件；默认值也是企微协议上限 20,971,520 字节（20 MiB）。该工具仅在当前企微回合生效，因此从网页继续同一会话时，不能向上一次企微目标发送文件。配置的工作目录包含非公开数据时，应使用白名单策略。
+
+Harness 请求工具审批时，插件会向原企微会话发送绑定请求者的六位短码。回复 `/approve <短码>` 只允许该操作一次，回复 `/reject <短码>` 拒绝该操作。短码只能消费一次，不能跨会话使用；原回合等待期间，审批命令会绕过普通消息并发限制。超时、取消、发送失败或服务退出都会按失败闭合。`approvalTimeoutMs` 必须小于 `responseTimeoutMs`。
 
 默认长连接地址为 `wss://openws.work.weixin.qq.com`，`scene` 默认为企微智能机器人长连接所需的 `1`。私有部署企业可以按企微管理后台显示的值覆盖这些配置。
 
@@ -119,6 +123,8 @@ pong — DeepSeek Harness 企微机器人已连接。
 发送 `/new` 后，机器人应确认已经开启新对话；随后询问旧对话中的细节，Agent 不应继续使用旧上下文。发送 `/compact`、`/goal` 或 `/plan` 时，插件应直接显示 Harness 命令结果，回复中不应出现模型对斜杠命令的解释。未知或未开放的斜杠命令应被明确拒绝，不能送入模型。
 
 验证入站文件时，可以发送一个较小的文本或文档文件，并让机器人总结其内容。Agent 应使用下载后的本地路径调用相应文件或 shell 工具，不能再回复“插件只支持文本和图片”；引用文件也走同一条链路。
+
+验证审批时，要求执行当前权限 preset 规定必须审批的操作，并原样回复机器人给出的 `/approve <短码>` 或 `/reject <短码>`；同一回合应继续或停止，网页不应再接管这次审批。
 
 验证 Markdown 时，可以要求回复包含标题、列表、链接、强调、引用和围栏代码块，企微应渲染这些结构而不是显示传输标记。验证工具路由时，可以发送“我当前有什么文件？”；Agent 应执行所配置的文件系统或 shell 工具并返回结果，回复中不能出现 `<｜｜DSML｜｜tool_calls>` 或 `<｜｜DSML｜｜invoke>`。随后在网页继续同一个 `wecom-v2-` session，工具调用也应保持正常。
 

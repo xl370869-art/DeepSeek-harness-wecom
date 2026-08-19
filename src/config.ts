@@ -39,6 +39,7 @@ export interface Config {
   welcomeText: string
   startupTimeoutMs: number
   responseTimeoutMs: number
+  approvalTimeoutMs: number
   mediaDownloadTimeoutMs: number
   sendTimeoutMs: number
   reconnectIntervalMs: number
@@ -71,6 +72,7 @@ export const Config: z<Config> = z.object({
   welcomeText: z.string().default(''),
   startupTimeoutMs: z.number().step(1).min(1).default(30_000),
   responseTimeoutMs: z.number().step(1).min(1).default(300_000),
+  approvalTimeoutMs: z.number().step(1).min(1_000).default(240_000),
   mediaDownloadTimeoutMs: z.number().step(1).min(1).default(30_000),
   sendTimeoutMs: z.number().step(1).min(1).default(30_000),
   reconnectIntervalMs: z.number().step(1).min(100).default(1_000),
@@ -88,7 +90,7 @@ export const Config: z<Config> = z.object({
     + 'claiming that file attachments are unavailable or pasting the whole file. '
     + 'Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. '
     + 'Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. '
-    + 'Do not reveal credentials or internal system data. When a request needs an interactive approval '
-    + 'that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely.',
+    + 'Do not reveal credentials or internal system data. Interactive tool approvals are routed to the same WeCom '
+    + 'conversation through /approve and /reject commands; wait for the recorded decision and never fabricate one.',
   ),
 })

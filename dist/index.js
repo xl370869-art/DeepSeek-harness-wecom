@@ -10,72 +10,16 @@ import {
   WSReconnectExhaustedError
 } from "@wecom/aibot-node-sdk";
 
-// src/conversations.ts
-import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { SessionId } from "@deepseek-ai/dsh-session";
-import { defineTool } from "@deepseek-ai/dsh-tools";
-
-// src/inbound-file.ts
-import { createHash } from "crypto";
-import { chmod, mkdir, readFile, realpath, writeFile } from "fs/promises";
-import { isAbsolute, join, relative, sep } from "path";
-var MAX_STORED_FILENAME_BYTES = 180;
-function isExists(error) {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
-}
-function isOutside(root, candidate) {
-  const pathFromRoot = relative(root, candidate);
-  return pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot);
-}
-function safeFilename(filename, digest) {
-  const leaf = (filename ?? "").replaceAll("\\", "/").split("/").at(-1)?.trim() ?? "";
-  const cleaned = leaf.replace(/[\u0000-\u001f\u007f<>:"|?*]/gu, "_").replace(/[. ]+$/u, "");
-  const fallback = `wecom-file-${digest.slice(0, 12)}.bin`;
-  const source = cleaned.length === 0 || cleaned === "." || cleaned === ".." ? fallback : cleaned;
-  let bounded = "";
-  for (const codePoint of source) {
-    if (Buffer.byteLength(bounded + codePoint) > MAX_STORED_FILENAME_BYTES) break;
-    bounded += codePoint;
-  }
-  return bounded || fallback;
-}
-async function saveInboundFile(root, conversationId, data, filename, maxBytes) {
-  if (!isAbsolute(root)) throw new Error(`wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(root)}`);
-  if (data.byteLength > maxBytes) {
-    throw new Error(`WeCom file is ${data.byteLength} bytes; configured inbound limit is ${maxBytes} bytes`);
-  }
-  await mkdir(root, { recursive: true, mode: 448 });
-  const canonicalRoot = await realpath(root);
-  await chmod(canonicalRoot, 448);
-  const conversationKey = createHash("sha256").update(conversationId).digest("hex").slice(0, 32);
-  const digest = createHash("sha256").update(data).digest("hex");
-  const directory = join(canonicalRoot, conversationKey, digest);
-  await mkdir(directory, { recursive: true, mode: 448 });
-  const canonicalDirectory = await realpath(directory);
-  if (isOutside(canonicalRoot, canonicalDirectory)) {
-    throw new Error("wecom-channel: inbound file directory resolves outside its configured root");
-  }
-  await chmod(canonicalDirectory, 448);
-  const name2 = safeFilename(filename, digest);
-  const path = join(canonicalDirectory, name2);
-  try {
-    await writeFile(path, data, { flag: "wx", mode: 384 });
-  } catch (error) {
-    if (!isExists(error)) throw error;
-    const existing = await readFile(path);
-    if (!existing.equals(data)) throw new Error("wecom-channel: existing inbound file does not match its content digest");
-  }
-  return { path, name: name2, bytes: data.byteLength };
-}
+// src/approvals.ts
+import { randomInt } from "crypto";
 
 // src/util.ts
-import { createHash as createHash2 } from "crypto";
+import { createHash } from "crypto";
 function sessionIdFor(accountId, message) {
   const scope = message.chattype === "group" ? "group" : "single";
   const peer = scope === "group" ? message.chatid : message.from.userid;
   if (peer === void 0 || peer.length === 0) throw new Error(`WeCom ${scope} message has no peer identifier`);
-  const digest = createHash2("sha256").update(`${accountId}\0${scope}\0${peer}`).digest("hex").slice(0, 32);
+  const digest = createHash("sha256").update(`${accountId}\0${scope}\0${peer}`).digest("hex").slice(0, 32);
   return `wecom-v2-${scope}-${digest}`;
 }
 function chatTarget(message) {
@@ -129,6 +73,177 @@ var SeenMessageIds = class {
     return false;
   }
 };
+
+// src/approvals.ts
+function parseApprovalCommand(text) {
+  const trimmed = text.trim();
+  if (!/^\/(?:approve|reject)(?:\s|$)/iu.test(trimmed)) return void 0;
+  const match = /^\/(approve|reject)\s+([0-9]{6})$/iu.exec(trimmed);
+  if (match === null) return "invalid";
+  return {
+    code: match[2],
+    outcome: match[1]?.toLowerCase() === "approve" ? "allowed-once" : "rejected"
+  };
+}
+var WeComApprovalRegistry = class {
+  constructor(timeoutMs) {
+    this.timeoutMs = timeoutMs;
+  }
+  timeoutMs;
+  pending = /* @__PURE__ */ new Map();
+  /** Send one approval prompt and await its single decision. */
+  async request(conversationId, request, sendPrompt) {
+    if (request.signal?.aborted) return "cancelled";
+    const code = this.createCode(conversationId);
+    const key = approvalKey(conversationId, code);
+    const decision = Promise.withResolvers();
+    let settled = false;
+    let timer;
+    const onAbort = () => {
+      pending.finish("cancelled");
+    };
+    const pending = {
+      conversationId,
+      code,
+      toolName: request.toolName,
+      finish: (outcome) => {
+        if (settled) return false;
+        settled = true;
+        this.pending.delete(key);
+        if (timer !== void 0) clearTimeout(timer);
+        request.signal?.removeEventListener("abort", onAbort);
+        decision.resolve(outcome);
+        return true;
+      }
+    };
+    this.pending.set(key, pending);
+    timer = setTimeout(() => pending.finish("unavailable"), this.timeoutMs);
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      await sendPrompt(formatApprovalPrompt(request, code, this.timeoutMs));
+    } catch {
+      pending.finish("unavailable");
+    }
+    return decision.promise;
+  }
+  /** Decide only a request originating from the same WeCom conversation. */
+  decide(conversationId, command) {
+    const pending = this.pending.get(approvalKey(conversationId, command.code));
+    if (pending === void 0 || !pending.finish(command.outcome)) return void 0;
+    return {
+      code: pending.code,
+      outcome: command.outcome,
+      toolName: pending.toolName
+    };
+  }
+  /** Cancel every pending request for one conversation. */
+  cancelConversation(conversationId) {
+    let cancelled = false;
+    for (const pending of [...this.pending.values()]) {
+      if (pending.conversationId !== conversationId) continue;
+      cancelled = pending.finish("cancelled") || cancelled;
+    }
+    return cancelled;
+  }
+  /** Cancel every pending request during channel teardown. */
+  cancelAll() {
+    for (const pending of [...this.pending.values()]) pending.finish("cancelled");
+  }
+  createCode(conversationId) {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const code = String(randomInt(1e5, 1e6));
+      if (!this.pending.has(approvalKey(conversationId, code))) return code;
+    }
+    throw new Error("wecom-channel: could not allocate a unique approval code");
+  }
+};
+function formatApprovalPrompt(request, code, timeoutMs) {
+  const toolName = request.toolName.toLowerCase() === "bash" ? "Bash" : request.toolName;
+  return [
+    toolName + " \u8BF7\u6C42\u6267\u884C\uFF1A" + approvalDetail(request),
+    "\u56DE\u590D /approve " + code + " \u6216 /reject " + code,
+    "\u8BE5\u5BA1\u6279\u5C06\u5728 " + Math.ceil(timeoutMs / 1e3) + " \u79D2\u540E\u5931\u6548\u3002"
+  ].join("\n");
+}
+function approvalDetail(request) {
+  const call = request.callId === void 0 ? void 0 : [...request.agent.session.events].reverse().find((event) => event.type === "tool/call" && event.data.callId === request.callId);
+  if (call?.type === "tool/call") {
+    try {
+      const parsed = JSON.parse(call.data.arguments);
+      if (isRecord(parsed) && typeof parsed.command === "string" && parsed.command.trim()) {
+        return truncateUtf8(parsed.command, 2e3, "\n[\u547D\u4EE4\u5DF2\u622A\u65AD]");
+      }
+    } catch {
+    }
+    if (call.data.arguments.trim()) return truncateUtf8(call.data.arguments, 2e3, "\n[\u53C2\u6570\u5DF2\u622A\u65AD]");
+  }
+  return truncateUtf8(request.reason?.trim() || "\u672A\u63D0\u4F9B\u64CD\u4F5C\u8BF4\u660E\u3002", 2e3, "\n[\u8BF4\u660E\u5DF2\u622A\u65AD]");
+}
+function approvalKey(conversationId, code) {
+  return conversationId + "\0" + code;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// src/conversations.ts
+import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
+import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { SessionId } from "@deepseek-ai/dsh-session";
+import { defineTool } from "@deepseek-ai/dsh-tools";
+
+// src/inbound-file.ts
+import { createHash as createHash2 } from "crypto";
+import { chmod, mkdir, readFile, realpath, writeFile } from "fs/promises";
+import { isAbsolute, join, relative, sep } from "path";
+var MAX_STORED_FILENAME_BYTES = 180;
+function isExists(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+function isOutside(root, candidate) {
+  const pathFromRoot = relative(root, candidate);
+  return pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot);
+}
+function safeFilename(filename, digest) {
+  const leaf = (filename ?? "").replaceAll("\\", "/").split("/").at(-1)?.trim() ?? "";
+  const cleaned = leaf.replace(/[\u0000-\u001f\u007f<>:"|?*]/gu, "_").replace(/[. ]+$/u, "");
+  const fallback = `wecom-file-${digest.slice(0, 12)}.bin`;
+  const source = cleaned.length === 0 || cleaned === "." || cleaned === ".." ? fallback : cleaned;
+  let bounded = "";
+  for (const codePoint of source) {
+    if (Buffer.byteLength(bounded + codePoint) > MAX_STORED_FILENAME_BYTES) break;
+    bounded += codePoint;
+  }
+  return bounded || fallback;
+}
+async function saveInboundFile(root, conversationId, data, filename, maxBytes) {
+  if (!isAbsolute(root)) throw new Error(`wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(root)}`);
+  if (data.byteLength > maxBytes) {
+    throw new Error(`WeCom file is ${data.byteLength} bytes; configured inbound limit is ${maxBytes} bytes`);
+  }
+  await mkdir(root, { recursive: true, mode: 448 });
+  const canonicalRoot = await realpath(root);
+  await chmod(canonicalRoot, 448);
+  const conversationKey = createHash2("sha256").update(conversationId).digest("hex").slice(0, 32);
+  const digest = createHash2("sha256").update(data).digest("hex");
+  const directory = join(canonicalRoot, conversationKey, digest);
+  await mkdir(directory, { recursive: true, mode: 448 });
+  const canonicalDirectory = await realpath(directory);
+  if (isOutside(canonicalRoot, canonicalDirectory)) {
+    throw new Error("wecom-channel: inbound file directory resolves outside its configured root");
+  }
+  await chmod(canonicalDirectory, 448);
+  const name2 = safeFilename(filename, digest);
+  const path = join(canonicalDirectory, name2);
+  try {
+    await writeFile(path, data, { flag: "wx", mode: 384 });
+  } catch (error) {
+    if (!isExists(error)) throw error;
+    const existing = await readFile(path);
+    if (!existing.equals(data)) throw new Error("wecom-channel: existing inbound file does not match its content digest");
+  }
+  return { path, name: name2, bytes: data.byteLength };
+}
 
 // src/inbound.ts
 async function inboundContent(ctx, config, client, message, includeImages = true) {
@@ -306,6 +421,7 @@ var ConversationManager = class {
     this.ctx = ctx;
     this.config = config;
     this.sendFile = sendFile;
+    this.approvals = new WeComApprovalRegistry(config.approvalTimeoutMs);
   }
   ctx;
   config;
@@ -315,6 +431,7 @@ var ConversationManager = class {
   queues = /* @__PURE__ */ new Map();
   activeTurns = /* @__PURE__ */ new Map();
   generations = /* @__PURE__ */ new Map();
+  approvals;
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
@@ -322,9 +439,9 @@ var ConversationManager = class {
     this.persistedIds = new Set(headers.map((header) => String(header.id)));
   }
   /** Process one inbound message after earlier work in the same WeCom conversation. */
-  process(message, client) {
+  process(message, client, sendApprovalPrompt = () => Promise.reject(new Error("WeCom approval prompt sender is unavailable"))) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client));
+    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client, sendApprovalPrompt));
   }
   /** End the current WeCom conversation session while retaining its history. */
   async reset(message) {
@@ -344,7 +461,7 @@ var ConversationManager = class {
     });
   }
   /** Execute a registered Harness command against the current WeCom session. */
-  executeCommand(message, line) {
+  executeCommand(message, line, sendApprovalPrompt = () => Promise.reject(new Error("WeCom approval prompt sender is unavailable"))) {
     const baseId = sessionIdFor(this.config.accountId, message);
     return this.enqueue(baseId, async () => {
       const id = this.currentSessionId(baseId);
@@ -361,6 +478,11 @@ var ConversationManager = class {
         controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
       }, this.config.responseTimeoutMs);
       this.activeTurns.set(id, chatTarget(message));
+      const stopApprovalAnswerer = agent.ctx.on(
+        "approval/request",
+        (request) => this.approvals.request(id, request, sendApprovalPrompt),
+        { prepend: true }
+      );
       try {
         const execution = await this.ctx.commands.execute(agent, line, controller.signal);
         if (execution === void 0) return { execution, response: void 0 };
@@ -369,6 +491,7 @@ var ConversationManager = class {
         const response = events.some((event) => event.type === "assistant/message") ? await this.collectReply(agent, events) : void 0;
         return { execution, response };
       } finally {
+        stopApprovalAnswerer();
         clearTimeout(timer);
         this.activeTurns.delete(id);
       }
@@ -378,13 +501,20 @@ var ConversationManager = class {
   cancel(message) {
     const baseId = sessionIdFor(this.config.accountId, message);
     const id = this.currentSessionId(baseId);
+    const approvalCancelled = this.approvals.cancelConversation(id);
     const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
-    if (agent === void 0 || agent.status === "idle") return false;
+    if (agent === void 0 || agent.status === "idle") return approvalCancelled;
     agent.cancel({ kind: "user" });
     return true;
   }
+  /** Resolve a pending approval from its originating WeCom conversation. */
+  decideApproval(message, command) {
+    const baseId = sessionIdFor(this.config.accountId, message);
+    return this.approvals.decide(this.currentSessionId(baseId), command);
+  }
   /** Dispose every bridge-owned Agent after queued message work settles. */
   async dispose() {
+    this.approvals.cancelAll();
     await Promise.allSettled(this.queues.values());
     await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
     this.bindings.clear();
@@ -418,18 +548,24 @@ var ConversationManager = class {
     this.generations.set(baseId, generation);
     return generation;
   }
-  async processNow(id, message, client) {
+  async processNow(id, message, client, sendApprovalPrompt) {
     const binding = await this.getOrCreate(id);
     const agent = binding.agent;
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent));
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
     const start = agent.session.events.length;
     this.activeTurns.set(id, chatTarget(message));
+    const stopApprovalAnswerer = agent.ctx.on(
+      "approval/request",
+      (request) => this.approvals.request(id, request, sendApprovalPrompt),
+      { prepend: true }
+    );
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
       return await this.collectReply(agent, agent.session.events.slice(start));
     } finally {
+      stopApprovalAnswerer();
       this.activeTurns.delete(id);
     }
   }
@@ -620,6 +756,9 @@ var WeComHarnessBridge = class {
         `wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(config.inboundFileDirectory)}`
       );
     }
+    if (config.approvalTimeoutMs >= config.responseTimeoutMs) {
+      throw new Error("wecom-channel: approvalTimeoutMs must be less than responseTimeoutMs");
+    }
     this.log = ctx.logger("deepseek-harness-wecom");
     this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file));
     this.seen = new SeenMessageIds(config.maxSeenMessageIds);
@@ -718,7 +857,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom/0.1.4"
+      plug_version: "deepseek-harness-wecom/0.1.5"
     });
   }
   async handleWelcome(frame) {
@@ -741,6 +880,20 @@ var WeComHarnessBridge = class {
     if (message === void 0 || this.seen.hasOrAdd(message.msgid) || !this.allowed(message)) return;
     try {
       const command = slashCommand(message);
+      const approvalCommand = parseApprovalCommand(command?.line ?? "");
+      if (approvalCommand === "invalid") {
+        await this.sendReply(frame, {
+          text: "\u5BA1\u6279\u547D\u4EE4\u683C\u5F0F\u4E0D\u6B63\u786E\u3002\u8BF7\u56DE\u590D /approve 123456 \u6216 /reject 123456\u3002",
+          images: []
+        });
+        return;
+      }
+      if (approvalCommand !== void 0) {
+        const resolved = this.conversations.decideApproval(message, approvalCommand);
+        const text = resolved === void 0 ? "\u6CA1\u6709\u627E\u5230\u5F85\u5904\u7406\u7684\u5BA1\u6279 " + approvalCommand.code + "\uFF1B\u5B83\u53EF\u80FD\u5DF2\u5B8C\u6210\u3001\u53D6\u6D88\u6216\u8D85\u65F6\u3002" : resolved.outcome === "allowed-once" ? "\u5DF2\u6279\u51C6 " + resolved.toolName + "\uFF08" + resolved.code + "\uFF09\uFF0C\u6B63\u5728\u7EE7\u7EED\u6267\u884C\u3002" : "\u5DF2\u62D2\u7EDD " + resolved.toolName + "\uFF08" + resolved.code + "\uFF09\u3002";
+        await this.sendReply(frame, { text, images: [] });
+        return;
+      }
       if (command?.name === "bot-ping") {
         await this.sendReply(frame, { text: "pong \u2014 DeepSeek Harness \u4F01\u5FAE\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\u3002", images: [] });
         return;
@@ -798,7 +951,11 @@ var WeComHarnessBridge = class {
         return;
       }
       if (command !== void 0 && this.allowedHarnessCommands.has(command.name)) {
-        const outcome = await this.conversations.executeCommand(message, command.line);
+        const outcome = await this.conversations.executeCommand(
+          message,
+          command.line,
+          (text) => this.sendReply(frame, { text, images: [] })
+        );
         await this.sendReply(frame, this.commandReply(command.name, outcome));
         return;
       }
@@ -809,7 +966,11 @@ var WeComHarnessBridge = class {
         });
         return;
       }
-      const reply = await this.conversations.process(message, this.requireClient());
+      const reply = await this.conversations.process(
+        message,
+        this.requireClient(),
+        (text) => this.sendReply(frame, { text, images: [] })
+      );
       await this.sendReply(frame, reply);
     } catch (error) {
       this.log.error("WeCom message %s failed: %s", message.msgid, String(error));
@@ -832,6 +993,8 @@ var WeComHarnessBridge = class {
       "/bot-file-test \u2014 \u53D1\u9001\u4E00\u4E2A\u6587\u672C\u9644\u4EF6\uFF0C\u68C0\u67E5\u6587\u4EF6\u51FA\u7AD9\u94FE\u8DEF",
       "/bot-status \u2014 \u67E5\u770B\u5F53\u524D\u4F1A\u8BDD\u72B6\u6001",
       "/bot-cancel \u2014 \u53D6\u6D88\u5F53\u524D\u751F\u6210",
+      "/approve 123456 \u2014 \u6279\u51C6\u4E00\u6B21\u5F85\u5904\u7406\u5DE5\u5177\u8C03\u7528",
+      "/reject 123456 \u2014 \u62D2\u7EDD\u4E00\u6B21\u5F85\u5904\u7406\u5DE5\u5177\u8C03\u7528",
       `\u5DF2\u5F00\u653E\u7684 Harness \u547D\u4EE4\uFF1A${harnessCommands}\uFF08\u4EC5\u5728\u5F53\u524D preset \u6CE8\u518C\u540E\u53EF\u7528\uFF09`,
       "\u5176\u4ED6\u659C\u6760\u547D\u4EE4\u4F1A\u88AB\u63D2\u4EF6\u62D2\u7EDD\uFF0C\u4E0D\u4F1A\u9001\u7ED9\u6A21\u578B\uFF1B\u666E\u901A\u6D88\u606F\u4F1A\u4EA4\u7ED9\u5F53\u524D Harness \u9ED8\u8BA4\u6A21\u578B\u5904\u7406\u3002"
     ].join("\n");
@@ -980,6 +1143,7 @@ var Config = z.object({
   welcomeText: z.string().default(""),
   startupTimeoutMs: z.number().step(1).min(1).default(3e4),
   responseTimeoutMs: z.number().step(1).min(1).default(3e5),
+  approvalTimeoutMs: z.number().step(1).min(1e3).default(24e4),
   mediaDownloadTimeoutMs: z.number().step(1).min(1).default(3e4),
   sendTimeoutMs: z.number().step(1).min(1).default(3e4),
   reconnectIntervalMs: z.number().step(1).min(100).default(1e3),
@@ -991,7 +1155,7 @@ var Config = z.object({
   maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   systemPrompt: z.string().default(
-    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
+    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. Interactive tool approvals are routed to the same WeCom conversation through /approve and /reject commands; wait for the recorded decision and never fabricate one."
   )
 });
 
@@ -1001,6 +1165,7 @@ var inject = [
   "agentDefaultModel",
   "agentPresets",
   "agents",
+  "approval",
   "attachments",
   "commands",
   "credentials",
@@ -1008,25 +1173,39 @@ var inject = [
   "sessionPersistence",
   "systemPrompt"
 ];
-async function apply(ctx, config) {
-  const bridge = new WeComHarnessBridge(ctx, config);
-  await ctx.effect(async function* () {
-    yield async () => bridge.stop();
-    await bridge.start();
+function mountBridge(ctx, bridge) {
+  const log = ctx.logger("deepseek-harness-wecom");
+  ctx.effect(() => {
+    const startup = Promise.resolve().then(() => bridge.start()).catch(async (error) => {
+      await Promise.allSettled([bridge.stop()]);
+      log.warn("WeCom channel remains offline: %s. Harness startup is unaffected.", String(error));
+    });
+    return async () => {
+      await startup;
+      await bridge.stop();
+    };
   }, "deepseek-harness-wecom.websocket");
+}
+function apply(ctx, config) {
+  const bridge = new WeComHarnessBridge(ctx, config);
+  mountBridge(ctx, bridge);
 }
 var index_default = { name, inject, Config, apply };
 export {
   Config,
   SeenMessageIds,
+  WeComApprovalRegistry,
   WeComHarnessBridge,
   apply,
   chatTarget,
   index_default as default,
   detectImageMediaType,
+  formatApprovalPrompt,
   inboundContent,
   inject,
+  mountBridge,
   name,
+  parseApprovalCommand,
   sessionIdFor,
   truncateUtf8
 };

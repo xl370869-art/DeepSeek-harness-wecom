@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { detectImageMediaType, inboundContent } from '../src/inbound.js'
 import { testConfig } from './fixtures.js'
@@ -111,7 +111,7 @@ describe('inboundContent', () => {
     const encodedPath = text.match(/local path ("(?:[^"\\]|\\.)*")/u)?.[1]
     expect(encodedPath).toBeDefined()
     const path = JSON.parse(encodedPath as string) as string
-    expect(path.startsWith(root)).toBe(true)
+    expect(relative(await realpath(root), path)).not.toMatch(/^\.\./u)
     expect(await readFile(path)).toEqual(data)
   })
 

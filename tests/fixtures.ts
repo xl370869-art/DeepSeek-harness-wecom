@@ -19,6 +19,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     welcomeText: '',
     startupTimeoutMs: 1_000,
     responseTimeoutMs: 1_000,
+    approvalTimeoutMs: 500,
     mediaDownloadTimeoutMs: 1_000,
     sendTimeoutMs: 1_000,
     reconnectIntervalMs: 100,

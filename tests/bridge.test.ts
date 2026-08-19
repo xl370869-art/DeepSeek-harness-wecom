@@ -100,6 +100,7 @@ function agentContext(
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
     session: { events },
+    ctx: { on: vi.fn(() => vi.fn()) },
     followup: vi.fn(() => {
       events.push({
         type: 'assistant/message',

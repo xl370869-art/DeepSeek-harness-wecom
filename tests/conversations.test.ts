@@ -31,6 +31,7 @@ describe('ConversationManager', () => {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
       session: { events },
+      ctx: { on: vi.fn(() => vi.fn()) },
       followup: vi.fn(() => {
         promptDuringTurn = promptText?.() ?? ''
         events.push({
@@ -87,6 +88,7 @@ describe('ConversationManager', () => {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
       session: { events },
+      ctx: { on: vi.fn(() => vi.fn()) },
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -146,7 +148,7 @@ describe('ConversationManager', () => {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
       session: { events },
-      ctx: { systemPrompt: { section }, tools: { register } },
+      ctx: { on: vi.fn(() => vi.fn()), systemPrompt: { section }, tools: { register } },
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -203,6 +205,7 @@ describe('ConversationManager', () => {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
       session: { events },
+      ctx: { on: vi.fn(() => vi.fn()) },
       followup: vi.fn(() => {
         if (fileTool === undefined) throw new Error('wecom_send_file was not registered')
         runningUpload = fileTool.execute(
@@ -275,6 +278,7 @@ describe('ConversationManager', () => {
         status: 'idle',
         options: { provider: 'deepseek', model: 'deepseek-chat' },
         session: { events },
+        ctx: { on: vi.fn(() => vi.fn()) },
         followup: vi.fn(() => {
           events.push({
             type: 'assistant/message',
