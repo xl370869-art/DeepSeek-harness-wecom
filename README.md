@@ -34,13 +34,13 @@ An independent out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/dee
 
 - Node.js 22.19 or later
 - pnpm 10.33.4
-- DeepSeek Harness 0.1.0-rc.7 or later
+- DeepSeek Harness 0.2.1-rc.2 or later
 - A WeCom AI Bot with long connection enabled and a Bot ID/Secret
 
 ## Install from GitHub
 
 ```sh
-pnpm dsh plugin --profile web add github:sliverp/DeepSeek-harness-wecom
+pnpm dsh plugin --profile web add github:xl370869-art/DeepSeek-harness-wecom#v0.1.6-dsh.1
 ```
 
 For a local checkout:

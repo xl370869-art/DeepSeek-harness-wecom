@@ -99,7 +99,7 @@ function agentContext(
   const agent = {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { events },
+    session: { events, id: 'bridge-session', get seq() { return events.length } },
     ctx: { on: vi.fn(() => vi.fn()) },
     followup: vi.fn(() => {
       events.push({
@@ -121,6 +121,9 @@ function agentContext(
     logger: vi.fn(() => logger),
     credentials: { resolve: vi.fn(async () => ({ value: 'resolved-secret', source: 'test' })) },
     commands: { execute: executeCommand },
+    sessionQuery: { observeSession: vi.fn(async () => ({
+      header: {}, events: [...events], [Symbol.dispose]: vi.fn(),
+    })) },
     sessionPersistence: { list: vi.fn(async () => []) },
     agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
     agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -257,7 +260,7 @@ describe('WeComHarnessBridge', () => {
     await bridge.start()
     await client.message(textMessage('/GOAL Keep API Names', 'm-goal'))
 
-    expect(execute).toHaveBeenCalledWith(expect.anything(), '/goal Keep API Names', expect.any(AbortSignal))
+    expect(execute).toHaveBeenCalledWith(expect.anything(), '/goal Keep API Names', [], expect.any(AbortSignal))
     expect(client.replies[0]?.content).toBe('目标已更新。')
     await bridge.stop()
   })

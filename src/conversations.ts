@@ -1,7 +1,8 @@
+import { inspectSession, readSessionEvents } from './session-read.js'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
+import { resolveSessionPreset } from './session-preset.js'
 import type { CommandExecution } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
@@ -55,13 +56,13 @@ export class ConversationManager {
     private readonly config: Config,
     private readonly sendFile: ConversationFileSender,
   ) {
-    this.approvals = new WeComApprovalRegistry(config.approvalTimeoutMs)
+    this.approvals = new WeComApprovalRegistry(config.approvalTimeoutMs, ctx)
   }
 
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize(): Promise<void> {
     const headers = await this.ctx.sessionPersistence.list()
-    this.persistedIds = new Set(headers.map(header => String(header.id)))
+    this.persistedIds = new Set(headers.map(header => String(header.header.id)))
   }
 
   /** Process one inbound message after earlier work in the same WeCom conversation. */
@@ -111,7 +112,7 @@ export class ConversationManager {
         this.config.responseTimeoutMs,
         'DeepSeek Harness conversation availability',
       )
-      const start = agent.session.events.length
+      const start = agent.session.seq
       const controller = new AbortController()
       const timer = setTimeout(() => {
         controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
@@ -123,10 +124,10 @@ export class ConversationManager {
         { prepend: true },
       )
       try {
-        const execution = await this.ctx.commands.execute(agent, line, controller.signal)
+        const execution = await this.ctx.commands.execute(agent, line, [], controller.signal)
         if (execution === undefined) return { execution, response: undefined }
         await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness command response')
-        const events = agent.session.events.slice(start)
+        const events = (await readSessionEvents(this.ctx, agent.session.id)).slice(start)
         const response = events.some(event => event.type === 'assistant/message')
           ? await this.collectReply(agent, events)
           : undefined
@@ -206,7 +207,7 @@ export class ConversationManager {
     const agent = binding.agent
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent))
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
-    const start = agent.session.events.length
+    const start = agent.session.seq
     this.activeTurns.set(id, chatTarget(message))
     const stopApprovalAnswerer = agent.ctx.on(
       'approval/request',
@@ -216,7 +217,7 @@ export class ConversationManager {
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
-      return await this.collectReply(agent, agent.session.events.slice(start))
+      return await this.collectReply(agent, (await readSessionEvents(this.ctx, agent.session.id)).slice(start))
     } finally {
       stopApprovalAnswerer()
       this.activeTurns.delete(id)
@@ -258,7 +259,7 @@ export class ConversationManager {
     const current = this.ctx.agentDefaultModel.currentSelection()
     const agentOptions = { provider: current.provider, model: current.model }
     if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId)
+      const inspected = await inspectSession(this.ctx, sessionId)
       const agentPreset = resolveSessionPreset({
         header: inspected.meta,
         events: inspected.events,

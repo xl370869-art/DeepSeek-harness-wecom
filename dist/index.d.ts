@@ -126,8 +126,9 @@ declare function parseApprovalCommand(text: string): ApprovalCommand | 'invalid'
 /** Owns requester-bound, expiring approval decisions for the WeCom channel. */
 declare class WeComApprovalRegistry {
     private readonly timeoutMs;
+    private readonly context?;
     private readonly pending;
-    constructor(timeoutMs: number);
+    constructor(timeoutMs: number, context?: Context | undefined);
     /** Send one approval prompt and await its single decision. */
     request(conversationId: string, request: ApprovalRequest, sendPrompt: (text: string) => Promise<void>): Promise<ApprovalOutcome>;
     /** Decide only a request originating from the same WeCom conversation. */
@@ -139,7 +140,7 @@ declare class WeComApprovalRegistry {
     private createCode;
 }
 /** Render the structured tool call associated with one Harness approval request. */
-declare function formatApprovalPrompt(request: ApprovalRequest, code: string, timeoutMs: number): string;
+declare function formatApprovalPrompt(request: ApprovalRequest, code: string, timeoutMs: number, context?: Context): Promise<string>;
 
 /** Deterministic, non-identifying DSH session id for one WeCom conversation. */
 declare function sessionIdFor(accountId: string, message: Pick<BaseMessage, 'chattype' | 'chatid' | 'from'>): string;

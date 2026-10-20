@@ -1,3 +1,5 @@
+import type { Context } from '@deepseek-ai/cordis'
+import { readSessionEvents } from './session-read.js'
 import { randomInt } from 'node:crypto'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import { truncateUtf8 } from './util.js'
@@ -38,7 +40,7 @@ export function parseApprovalCommand(text: string): ApprovalCommand | 'invalid' 
 export class WeComApprovalRegistry {
   private readonly pending = new Map<string, PendingApproval>()
 
-  constructor(private readonly timeoutMs: number) {}
+  constructor(private readonly timeoutMs: number, private readonly context?: Context) {}
 
   /** Send one approval prompt and await its single decision. */
   async request(
@@ -71,7 +73,12 @@ export class WeComApprovalRegistry {
     timer = setTimeout(() => pending.finish('unavailable'), this.timeoutMs)
     request.signal?.addEventListener('abort', onAbort, { once: true })
     try {
-      await sendPrompt(formatApprovalPrompt(request, code, this.timeoutMs))
+      const rendered = await Promise.race([
+        formatApprovalPrompt(request, code, this.timeoutMs, this.context).then(text => ({ text })),
+        decision.promise.then(outcome => ({ outcome })),
+      ])
+      if ('outcome' in rendered) return rendered.outcome
+      if (!settled) await sendPrompt(rendered.text)
     } catch {
       pending.finish('unavailable')
     }
@@ -114,19 +121,19 @@ export class WeComApprovalRegistry {
 }
 
 /** Render the structured tool call associated with one Harness approval request. */
-export function formatApprovalPrompt(request: ApprovalRequest, code: string, timeoutMs: number): string {
+export async function formatApprovalPrompt(request: ApprovalRequest, code: string, timeoutMs: number, context?: Context): Promise<string> {
   const toolName = request.toolName.toLowerCase() === 'bash' ? 'Bash' : request.toolName
   return [
-    toolName + ' 请求执行：' + approvalDetail(request),
+    toolName + ' 请求执行：' + await approvalDetail(request, context),
     '回复 /approve ' + code + ' 或 /reject ' + code,
     '该审批将在 ' + Math.ceil(timeoutMs / 1_000) + ' 秒后失效。',
   ].join('\n')
 }
 
-function approvalDetail(request: ApprovalRequest): string {
+async function approvalDetail(request: ApprovalRequest, context?: Context): Promise<string> {
   const call = request.callId === undefined
     ? undefined
-    : [...request.agent.session.events].reverse().find(event => event.type === 'tool/call'
+    : [...await readSessionEvents(context ?? request.agent.ctx, request.agent.session.id)].reverse().find(event => event.type === 'tool/call'
         && event.data.callId === request.callId)
   if (call?.type === 'tool/call') {
     try {

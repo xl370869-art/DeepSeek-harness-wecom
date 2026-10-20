@@ -15,6 +15,7 @@ export const inject = [
   'credentials',
   'llm',
   'sessionPersistence',
+  'sessionQuery',
   'systemPrompt',
 ]
 export { Config }

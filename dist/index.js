@@ -10,6 +10,19 @@ import {
   WSReconnectExhaustedError
 } from "@wecom/aibot-node-sdk";
 
+// src/session-read.ts
+async function inspectSession(ctx, id) {
+  const observation = await ctx.sessionQuery.observeSession(id, { projectionMode: "none" });
+  try {
+    return { meta: observation.header, events: [...observation.events] };
+  } finally {
+    observation[Symbol.dispose]();
+  }
+}
+async function readSessionEvents(ctx, id) {
+  return (await inspectSession(ctx, id)).events;
+}
+
 // src/approvals.ts
 import { randomInt } from "crypto";
 
@@ -86,10 +99,12 @@ function parseApprovalCommand(text) {
   };
 }
 var WeComApprovalRegistry = class {
-  constructor(timeoutMs) {
+  constructor(timeoutMs, context) {
     this.timeoutMs = timeoutMs;
+    this.context = context;
   }
   timeoutMs;
+  context;
   pending = /* @__PURE__ */ new Map();
   /** Send one approval prompt and await its single decision. */
   async request(conversationId, request, sendPrompt) {
@@ -120,7 +135,12 @@ var WeComApprovalRegistry = class {
     timer = setTimeout(() => pending.finish("unavailable"), this.timeoutMs);
     request.signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      await sendPrompt(formatApprovalPrompt(request, code, this.timeoutMs));
+      const rendered = await Promise.race([
+        formatApprovalPrompt(request, code, this.timeoutMs, this.context).then((text) => ({ text })),
+        decision.promise.then((outcome) => ({ outcome }))
+      ]);
+      if ("outcome" in rendered) return rendered.outcome;
+      if (!settled) await sendPrompt(rendered.text);
     } catch {
       pending.finish("unavailable");
     }
@@ -157,16 +177,16 @@ var WeComApprovalRegistry = class {
     throw new Error("wecom-channel: could not allocate a unique approval code");
   }
 };
-function formatApprovalPrompt(request, code, timeoutMs) {
+async function formatApprovalPrompt(request, code, timeoutMs, context) {
   const toolName = request.toolName.toLowerCase() === "bash" ? "Bash" : request.toolName;
   return [
-    toolName + " \u8BF7\u6C42\u6267\u884C\uFF1A" + approvalDetail(request),
+    toolName + " \u8BF7\u6C42\u6267\u884C\uFF1A" + await approvalDetail(request, context),
     "\u56DE\u590D /approve " + code + " \u6216 /reject " + code,
     "\u8BE5\u5BA1\u6279\u5C06\u5728 " + Math.ceil(timeoutMs / 1e3) + " \u79D2\u540E\u5931\u6548\u3002"
   ].join("\n");
 }
-function approvalDetail(request) {
-  const call = request.callId === void 0 ? void 0 : [...request.agent.session.events].reverse().find((event) => event.type === "tool/call" && event.data.callId === request.callId);
+async function approvalDetail(request, context) {
+  const call = request.callId === void 0 ? void 0 : [...await readSessionEvents(context ?? request.agent.ctx, request.agent.session.id)].reverse().find((event) => event.type === "tool/call" && event.data.callId === request.callId);
   if (call?.type === "tool/call") {
     try {
       const parsed = JSON.parse(call.data.arguments);
@@ -186,8 +206,16 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// src/session-preset.ts
+function resolveSessionPreset(session) {
+  let preset = session.header.agentPreset;
+  for (const event of session.events) {
+    if (event.type === "agent-preset/selected") preset = event.data.agentPreset;
+  }
+  return preset;
+}
+
 // src/conversations.ts
-import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { defineTool } from "@deepseek-ai/dsh-tools";
@@ -421,7 +449,7 @@ var ConversationManager = class {
     this.ctx = ctx;
     this.config = config;
     this.sendFile = sendFile;
-    this.approvals = new WeComApprovalRegistry(config.approvalTimeoutMs);
+    this.approvals = new WeComApprovalRegistry(config.approvalTimeoutMs, ctx);
   }
   ctx;
   config;
@@ -436,7 +464,7 @@ var ConversationManager = class {
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
     const headers = await this.ctx.sessionPersistence.list();
-    this.persistedIds = new Set(headers.map((header) => String(header.id)));
+    this.persistedIds = new Set(headers.map((header) => String(header.header.id)));
   }
   /** Process one inbound message after earlier work in the same WeCom conversation. */
   process(message, client, sendApprovalPrompt = () => Promise.reject(new Error("WeCom approval prompt sender is unavailable"))) {
@@ -472,7 +500,7 @@ var ConversationManager = class {
         this.config.responseTimeoutMs,
         "DeepSeek Harness conversation availability"
       );
-      const start = agent.session.events.length;
+      const start = agent.session.seq;
       const controller = new AbortController();
       const timer = setTimeout(() => {
         controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
@@ -484,10 +512,10 @@ var ConversationManager = class {
         { prepend: true }
       );
       try {
-        const execution = await this.ctx.commands.execute(agent, line, controller.signal);
+        const execution = await this.ctx.commands.execute(agent, line, [], controller.signal);
         if (execution === void 0) return { execution, response: void 0 };
         await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command response");
-        const events = agent.session.events.slice(start);
+        const events = (await readSessionEvents(this.ctx, agent.session.id)).slice(start);
         const response = events.some((event) => event.type === "assistant/message") ? await this.collectReply(agent, events) : void 0;
         return { execution, response };
       } finally {
@@ -553,7 +581,7 @@ var ConversationManager = class {
     const agent = binding.agent;
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent));
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
-    const start = agent.session.events.length;
+    const start = agent.session.seq;
     this.activeTurns.set(id, chatTarget(message));
     const stopApprovalAnswerer = agent.ctx.on(
       "approval/request",
@@ -563,7 +591,7 @@ var ConversationManager = class {
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
-      return await this.collectReply(agent, agent.session.events.slice(start));
+      return await this.collectReply(agent, (await readSessionEvents(this.ctx, agent.session.id)).slice(start));
     } finally {
       stopApprovalAnswerer();
       this.activeTurns.delete(id);
@@ -600,7 +628,7 @@ var ConversationManager = class {
     const current = this.ctx.agentDefaultModel.currentSelection();
     const agentOptions = { provider: current.provider, model: current.model };
     if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId);
+      const inspected = await inspectSession(this.ctx, sessionId);
       const agentPreset2 = resolveSessionPreset({
         header: inspected.meta,
         events: inspected.events
@@ -1171,6 +1199,7 @@ var inject = [
   "credentials",
   "llm",
   "sessionPersistence",
+  "sessionQuery",
   "systemPrompt"
 ];
 function mountBridge(ctx, bridge) {

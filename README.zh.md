@@ -34,7 +34,7 @@
 
 - Node.js 22.19 或更高版本
 - pnpm 10.33.4
-- DeepSeek Harness 0.1.0-rc.7 或更高版本
+- DeepSeek Harness 0.2.1-rc.2 或更高版本
 - 已开启长连接并取得 Bot ID、Secret 的企微智能机器人
 
 ## 安装
@@ -42,7 +42,7 @@
 从 GitHub 安装到 web profile：
 
 ```sh
-pnpm dsh plugin --profile web add github:sliverp/DeepSeek-harness-wecom
+pnpm dsh plugin --profile web add github:xl370869-art/DeepSeek-harness-wecom#v0.1.6-dsh.1
 ```
 
 从本地检出安装：

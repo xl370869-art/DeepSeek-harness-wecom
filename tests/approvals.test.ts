@@ -1,4 +1,4 @@
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId as CallId } from '@deepseek-ai/dsh-llm/brand'
 import { describe, expect, it, vi } from 'vitest'
 import {
   formatApprovalPrompt,
@@ -9,7 +9,9 @@ import {
 function request(signal?: AbortSignal): never {
   return {
     agent: {
-      session: {
+      session: { id: 'approval-session' },
+      ctx: { sessionQuery: { observeSession: vi.fn(async () => ({
+        header: {}, [Symbol.dispose]: vi.fn(),
         events: [{
           type: 'tool/call',
           data: {
@@ -18,7 +20,7 @@ function request(signal?: AbortSignal): never {
             arguments: JSON.stringify({ command: 'ls -la' }),
           },
         }],
-      },
+      })) } },
     },
     callId: CallId('call-approval'),
     toolName: 'bash',
@@ -35,8 +37,8 @@ describe('WeCom approval commands', () => {
     expect(parseApprovalCommand('ordinary text')).toBeUndefined()
   })
 
-  it('renders the exact structured command without unrelated session content', () => {
-    const prompt = formatApprovalPrompt(request(), '123456', 30_000)
+  it('renders the exact structured command without unrelated session content', async () => {
+    const prompt = await formatApprovalPrompt(request(), '123456', 30_000)
     expect(prompt).toContain('Bash 请求执行：ls -la')
     expect(prompt).toContain('/approve 123456')
     expect(prompt).toContain('30 秒')
@@ -46,6 +48,7 @@ describe('WeCom approval commands', () => {
     const registry = new WeComApprovalRegistry(1_000)
     let prompt = ''
     const pending = registry.request('conversation-a', request(), async text => { prompt = text })
+    await vi.waitFor(() => expect(prompt).toContain('/approve '))
     const code = prompt.match(/\/approve ([0-9]{6})/u)?.[1]
     if (code === undefined) throw new Error('approval code was not rendered')
 
@@ -73,5 +76,26 @@ describe('WeCom approval commands', () => {
     const aborted = registry.request('aborted', request(controller.signal), vi.fn(async () => undefined))
     controller.abort()
     await expect(aborted).resolves.toBe('cancelled')
+  })
+})
+
+
+describe('asynchronous approval preview', () => {
+  it('cancels before a slow observation resolves and does not send stale prompts', async () => {
+    const controller = new AbortController()
+    const query = Promise.withResolvers<unknown>()
+    const release = vi.fn()
+    const send = vi.fn(async () => undefined)
+    const registry = new WeComApprovalRegistry(120_000)
+    const pending = registry.request('slow-query', {
+      agent: { session: { id: 'slow-query' },
+        ctx: { sessionQuery: { observeSession: () => query.promise } } },
+      toolName: 'bash', callId: 'slow-call', signal: controller.signal,
+    } as never, send)
+    controller.abort()
+    await expect(pending).resolves.toBe('cancelled')
+    query.resolve({ header: {}, events: [], [Symbol.dispose]: release })
+    await vi.waitFor(() => expect(release).toHaveBeenCalledOnce())
+    expect(send).not.toHaveBeenCalled()
   })
 })
